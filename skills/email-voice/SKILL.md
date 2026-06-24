@@ -9,7 +9,7 @@ Make outbound emails sound like the user. The system learns from **(draft, final
 
 ## Where the data lives
 
-- DB: `./emails.db` (override with `EMAIL_LEARN_DB=/path/db`)
+- DB: `~/.email-learn/emails.db` (global, shared across all projects). Override with `EMAIL_LEARN_DB=/path/db`.
 - CLI binary: `email-learn` (built from this repo — run `cargo build --release` first, then `./target/release/email-learn`, or alias it)
 
 The CLI does **not** call any LLM. You do all reasoning here, against the diffs it produces.

@@ -32,15 +32,25 @@ CREATE INDEX IF NOT EXISTS idx_lessons_tags ON lessons(tags);
 ";
 
 fn db_path() -> PathBuf {
-    // ponytail: env override for tests / CI; default to repo-local emails.db.
+    // ponytail: env override for tests / CI; default to a global shared DB so
+    // voice lessons accumulate across every project on the machine.
     if let Ok(p) = std::env::var("EMAIL_LEARN_DB") {
         return PathBuf::from(p);
     }
-    PathBuf::from("emails.db")
+    let mut p = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    p.push(".email-learn");
+    p.push("emails.db");
+    p
 }
 
 fn connect() -> anyhow::Result<Connection> {
-    let conn = Connection::open(db_path())?;
+    let p = db_path();
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let conn = Connection::open(p)?;
     conn.execute_batch(SCHEMA)?;
     Ok(conn)
 }

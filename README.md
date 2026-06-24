@@ -25,7 +25,7 @@ Then any pi agent can load it by name (`email-voice`) and follow its workflows.
 
 ## Data location
 
-- DB defaults to `./emails.db` in the directory you run from.
+- DB defaults to `~/.email-learn/emails.db` — global, shared across all projects so your voice lessons accumulate everywhere.
 - Override with `EMAIL_LEARN_DB=/abs/path/emails.db`.
 
 ## Commands
