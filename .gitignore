@@ -1,0 +1,8 @@
+# Pix Agent
+.pi/
+.pi-lens/
+
+
+# Added by cargo
+
+/target
