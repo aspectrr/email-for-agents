@@ -75,6 +75,10 @@ enum Cmd {
     },
     /// Delete a draft and its revisions (a finalized pair, if any, is kept).
     DeleteDraft { draft_id: i64 },
+    /// Delete a pair. Derived lessons are unlinked (kept), not deleted.
+    DeletePair { pair_id: i64 },
+    /// Delete a single lesson by id.
+    DeleteLesson { lesson_id: i64 },
     /// Run as an MCP server over stdio. Agents (pi, Claude, …) connect to this
     /// and get every CLI feature as tools: read pairs/diffs/lessons, record
     /// derived lessons, push and edit drafts, search.
@@ -177,6 +181,14 @@ fn run() -> anyhow::Result<()> {
         Cmd::DeleteDraft { draft_id } => {
             el::delete_draft(&conn, draft_id)?;
             println!("deleted draft {draft_id}");
+        }
+        Cmd::DeletePair { pair_id } => {
+            el::delete_pair(&conn, pair_id)?;
+            println!("deleted pair {pair_id}");
+        }
+        Cmd::DeleteLesson { lesson_id } => {
+            el::delete_lesson(&conn, lesson_id)?;
+            println!("deleted lesson {lesson_id}");
         }
         Cmd::Mcp => {
             // The MCP server speaks JSON-RPC over stdio and needs the tokio

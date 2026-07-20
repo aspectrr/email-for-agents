@@ -83,6 +83,8 @@ export const api = {
     invoke<number>("restore_revision", { draftId, revisionId }),
   finalizeDraft: (draftId: number) => invoke<number>("finalize_draft", { draftId }),
   deleteDraft: (draftId: number) => invoke<void>("delete_draft", { draftId }),
+  deletePair: (pairId: number) => invoke<void>("delete_pair", { pairId }),
+  deleteLesson: (lessonId: number) => invoke<void>("delete_lesson", { lessonId }),
   updateDraftMeta: (draftId: number, context: string | null, tags: string[]) =>
     invoke<void>("update_draft_meta", { draftId, context, tags }),
   listPairs: (limit = 100) => invoke<Pair[]>("list_pairs", { limit }),

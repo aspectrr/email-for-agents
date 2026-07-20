@@ -349,6 +349,24 @@ impl EmailServer {
         })
     }
 
+    /// Delete a pair. Derived lessons are unlinked (kept), not deleted.
+    #[tool(description = "Delete a pair. Derived lessons are unlinked (pair_id set to null) but kept in the corpus; a finalized draft is unlinked too.")]
+    fn delete_pair(&self, Parameters(p): Parameters<IdParams>) -> ToolResult {
+        tool_op(|conn| {
+            el::delete_pair(conn, p.id)?;
+            Ok(ok_json(serde_json::json!({ "deleted": true, "pair_id": p.id })))
+        })
+    }
+
+    /// Delete a single lesson by id.
+    #[tool(description = "Delete a single voice lesson by id. Its source pair, if any, is left intact.")]
+    fn delete_lesson(&self, Parameters(p): Parameters<IdParams>) -> ToolResult {
+        tool_op(|conn| {
+            el::delete_lesson(conn, p.id)?;
+            Ok(ok_json(serde_json::json!({ "deleted": true, "lesson_id": p.id })))
+        })
+    }
+
     /// Update a draft's context and/or tags without touching its content.
     #[tool(description = "Update a draft's context and tags without touching its revision history.")]
     fn update_draft_meta(&self, Parameters(p): Parameters<UpdateDraftMetaParams>) -> ToolResult {

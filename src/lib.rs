@@ -598,6 +598,20 @@ pub fn delete_draft(conn: &Connection, draft_id: i64) -> anyhow::Result<()> {
     conn.execute("DELETE FROM drafts WHERE id = ?1", params![draft_id])?;
     Ok(())
 }
+
+/// Delete a pair. The DB ON DELETE SET NULL on lessons.pair_id and
+/// drafts.finalized_pair_id leaves derived lessons (the corpus) and any
+/// finalized draft intact, just unlinked from this pair.
+pub fn delete_pair(conn: &Connection, pair_id: i64) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM pairs WHERE id = ?1", params![pair_id])?;
+    Ok(())
+}
+
+/// Delete a single lesson by id. Its source pair, if any, is left intact.
+pub fn delete_lesson(conn: &Connection, lesson_id: i64) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM lessons WHERE id = ?1", params![lesson_id])?;
+    Ok(())
+}
 /// History is never destroyed — this is your "restore in one place".
 pub fn restore_revision(
     conn: &Connection,

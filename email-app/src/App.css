@@ -113,6 +113,9 @@ code { background: var(--bg-3); padding: 1px 5px; border-radius: 4px; font-size:
 .lesson-list { list-style: none; margin: 0; padding: 0; flex: 1; overflow-y: auto; }
 .lesson-list li { padding: 10px 12px; border-bottom: 1px solid var(--border); font-size: 13px; }
 .lesson-meta { font-size: 11px; color: var(--muted); margin-top: 3px; }
+.lesson-row { display: flex; align-items: flex-start; gap: 8px; }
+.lesson-row .lesson-text { flex: 1; min-width: 0; }
+.lesson-row .confirm-group button, .lesson-row > button { font-size: 11px; padding: 2px 8px; white-space: nowrap; }
 .add-lesson { border-top: 1px solid var(--border); padding: 10px; display: flex; flex-direction: column; gap: 6px; }
 .add-lesson textarea { resize: vertical; }
 .add-row { display: flex; gap: 6px; }

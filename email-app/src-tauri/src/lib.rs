@@ -83,6 +83,18 @@ fn delete_draft(draft_id: i64) -> CmdResult<()> {
 }
 
 #[tauri::command]
+fn delete_pair(pair_id: i64) -> CmdResult<()> {
+    let c = conn()?;
+    s(el::delete_pair(&c, pair_id))
+}
+
+#[tauri::command]
+fn delete_lesson(lesson_id: i64) -> CmdResult<()> {
+    let c = conn()?;
+    s(el::delete_lesson(&c, lesson_id))
+}
+
+#[tauri::command]
 fn list_pairs(limit: Option<i64>) -> CmdResult<Vec<el::Pair>> {
     let c = conn()?;
     s(el::recent_pairs(&c, limit.unwrap_or(50) as usize))
@@ -131,6 +143,8 @@ pub fn run() {
             finalize_draft,
             update_draft_meta,
             delete_draft,
+            delete_pair,
+            delete_lesson,
             list_pairs,
             show_pair,
             list_lessons,

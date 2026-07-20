@@ -152,6 +152,21 @@ export default function App() {
     } catch (e) { flushError(e); }
   };
 
+  const deletePair = async (id: number) => {
+    try {
+      await api.deletePair(id);
+      setSelectedPair(null);
+      await reloadLibrary();
+    } catch (e) { flushError(e); }
+  };
+
+  const deleteLesson = async (id: number) => {
+    try {
+      await api.deleteLesson(id);
+      await reloadLibrary();
+    } catch (e) { flushError(e); }
+  };
+
   const reloadLibrary = useCallback(async () => {
     try {
       setPairs(await api.listPairs(200));
@@ -265,7 +280,8 @@ export default function App() {
               {rightTab === "lessons" && current && (
                 <LessonsPane lessons={lessons}
                   pairId={current.draft.finalized_pair_id}
-                  onChanged={reloadLibrary} />
+                  onChanged={reloadLibrary}
+                  onDeleteLesson={deleteLesson} />
               )}
             </div>
           </aside>
@@ -287,12 +303,12 @@ export default function App() {
             </ul>
           </aside>
           <section className="editor-pane pair-detail">
-            {selectedPair ? <PairDetail pair={selectedPair} /> : <div className="empty-editor">Select a pair.</div>}
+            {selectedPair ? <PairDetail pair={selectedPair} onDelete={deletePair} /> : <div className="empty-editor">Select a pair.</div>}
           </section>
           <aside className="right-pane">
             <div className="right-tabs"><button className="active">Lessons</button></div>
             <div className="right-body">
-              <LessonsPane lessons={lessons} pairId={selectedPair?.id ?? null} onChanged={reloadLibrary} />
+              <LessonsPane lessons={lessons} pairId={selectedPair?.id ?? null} onChanged={reloadLibrary} onDeleteLesson={deleteLesson} />
             </div>
           </aside>
         </div>
@@ -305,8 +321,13 @@ export default function App() {
             <ul className="lesson-list">
               {lessons.map(l => (
                 <li key={l.id}>
-                  <div>{l.lesson}</div>
-                  <div className="lesson-meta">L{l.id} · pair #{l.pair_id ?? "—"} · [{l.tags.join(", ")}]</div>
+                  <div className="lesson-row">
+                    <div className="lesson-text">
+                      <div>{l.lesson}</div>
+                      <div className="lesson-meta">L{l.id} · pair #{l.pair_id ?? "—"} · [{l.tags.join(", ")}]</div>
+                    </div>
+                    <ConfirmButton label="Delete" confirmLabel="Confirm" danger onConfirm={() => deleteLesson(l.id)} />
+                  </div>
                 </li>
               ))}
               {lessons.length === 0 && <li className="empty">No lessons yet. Derive one from a pair's diff.</li>}
@@ -417,8 +438,8 @@ function RevisionsPane({ revisions, onRestore }: {
   );
 }
 
-function LessonsPane({ lessons, pairId, onChanged }: {
-  lessons: Lesson[]; pairId: number | null; onChanged: () => void;
+function LessonsPane({ lessons, pairId, onChanged, onDeleteLesson }: {
+  lessons: Lesson[]; pairId: number | null; onChanged: () => void; onDeleteLesson: (id: number) => void;
 }) {
   const [text, setText] = useState("");
   const [tagsStr, setTagsStr] = useState("");
@@ -436,7 +457,15 @@ function LessonsPane({ lessons, pairId, onChanged }: {
     <div className="lessons">
       <ul className="lesson-list">
         {shown.map(l => (
-          <li key={l.id}><div>{l.lesson}</div><div className="lesson-meta">L{l.id} · pair #{l.pair_id ?? "—"} · [{l.tags.join(", ")}]</div></li>
+          <li key={l.id}>
+            <div className="lesson-row">
+              <div className="lesson-text">
+                <div>{l.lesson}</div>
+                <div className="lesson-meta">L{l.id} · pair #{l.pair_id ?? "—"} · [{l.tags.join(", ")}]</div>
+              </div>
+              <ConfirmButton label="Delete" confirmLabel="Confirm" danger onConfirm={() => onDeleteLesson(l.id)} />
+            </div>
+          </li>
         ))}
         {shown.length === 0 && pairId != null && <li className="empty small">No lessons for this pair yet. Derive one from the diff and add it here.</li>}
       </ul>
@@ -452,10 +481,13 @@ function LessonsPane({ lessons, pairId, onChanged }: {
   );
 }
 
-function PairDetail({ pair }: { pair: Pair }) {
+function PairDetail({ pair, onDelete }: { pair: Pair; onDelete: (id: number) => void }) {
   return (
     <div className="pair-detail-inner">
-      <h3>Pair #{pair.id} {pair.context && <span className="muted">— {pair.context}</span>}</h3>
+      <div className="meta-row">
+        <h3>Pair #{pair.id} {pair.context && <span className="muted">— {pair.context}</span>}</h3>
+        <ConfirmButton label="Delete" confirmLabel="Confirm delete" danger onConfirm={() => onDelete(pair.id)} />
+      </div>
       <div className="pair-tags">{pair.tags.join(", ")}</div>
       <div className="pair-cols">
         <div><h4>Draft</h4><pre>{pair.draft}</pre></div>
