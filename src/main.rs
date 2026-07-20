@@ -75,6 +75,10 @@ enum Cmd {
     },
     /// Delete a draft and its revisions (a finalized pair, if any, is kept).
     DeleteDraft { draft_id: i64 },
+    /// Run as an MCP server over stdio. Agents (pi, Claude, …) connect to this
+    /// and get every CLI feature as tools: read pairs/diffs/lessons, record
+    /// derived lessons, push and edit drafts, search.
+    Mcp,
 }
 
 fn read_text(path: &PathBuf) -> anyhow::Result<String> {
@@ -173,6 +177,14 @@ fn run() -> anyhow::Result<()> {
         Cmd::DeleteDraft { draft_id } => {
             el::delete_draft(&conn, draft_id)?;
             println!("deleted draft {draft_id}");
+        }
+        Cmd::Mcp => {
+            // The MCP server speaks JSON-RPC over stdio and needs the tokio
+            // runtime. Every other subcommand stays synchronous.
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(el::mcp::serve())?;
         }
     }
     Ok(())

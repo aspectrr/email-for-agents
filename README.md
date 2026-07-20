@@ -4,13 +4,14 @@ A local email client + library for teaching coding agents (pi, Claude Code, Curs
 
 The whole point is the loop: the agent drafts, you edit, the diff is captured and searchable, and every revision is restorable from one place. The *reasoning* (deriving voice rules from a diff) stays in the agent session — no LLM call leaves your agent.
 
-## Two surfaces, one library, one DB
+## Three surfaces, one library, one DB
 
 ```
 src/lib.rs                 shared library: schema, diff, pairs, lessons, drafts, revisions
-src/main.rs (email-learn)  CLI — learning loop + agent ingest
+src/mcp.rs                 MCP server (stdio) — every CLI feature as tools
+src/main.rs (email-learn)  CLI — learning loop, agent ingest, and `mcp` subcommand
 email-app/                 Tauri 2 desktop client (React + TS + Vite)
-~/.email-learn/emails.db   one shared SQLite DB (WAL) — CLI and app read/write the same file
+~/.email-learn/emails.db   one shared SQLite DB (WAL) — CLI, MCP server, and app all read/write it
 ```
 
 The CLI and the Tauri app both call into `email_learn` (the library), so there is exactly one implementation of the data model and the diffing. Overriding the DB path: `EMAIL_LEARN_DB=/abs/path/emails.db`.
@@ -39,13 +40,16 @@ The app has three views:
 
 ## Agent ingest
 
-The agent pushes a draft into the app via the CLI:
+The agent pushes a draft two ways:
 
+**CLI** (one-shot):
 ```bash
 email-learn draft body.txt --context "cold intro to investor" --tags pitch,external
 ```
 
-It then appears in the app's Drafts inbox for you to edit. (A small MCP server exposing `create_draft` / `finalize` / `query` is the planned next step — see Roadmap.)
+**MCP server** (preferred for agents) — connect once and call tools directly (no subprocess per call). See [MCP server](#mcp-server) below.
+
+Either way the draft appears in the app's Drafts inbox for you to edit.
 
 ## CLI
 
@@ -64,9 +68,34 @@ email-learn summarize                                                  # optiona
 email-learn draft <file|-> --context "<one line>" --tags a,b [--source agent]   # → draft id
 email-learn finalize <draft_id>                                                # → pair id
 email-learn drafts [--all]
+email-learn delete-draft <draft_id>                                            # remove a draft (keeps any finalized pair)
+
+# MCP server (stdio) — agents connect and call tools
+email-learn mcp                                                                # speaks JSON-RPC over stdio
 ```
 
 Install the CLI on its own: `cargo install --path .` (puts `email-learn` on `$PATH`).
+
+## MCP server
+
+`email-learn mcp` runs an MCP server over stdio exposing the full surface as tools — so a coding agent (pi, Claude, Cursor) can read pairs/diffs/lessons, record derived lessons, push and edit drafts, and search, all over one connection instead of shelling out per call. Built on [rmcp](https://crates.io/crates/rmcp) (the official Rust MCP SDK).
+
+**17 tools:** `add_pair`, `show_pair`, `recent_pairs`, `list_lessons`, `add_lesson`, `query`, `search`, `export`, `summarize`, `create_draft`, `get_draft`, `list_drafts`, `save_revision`, `restore_revision`, `finalize_draft`, `delete_draft`, `update_draft_meta`. Diffs come back as plain unified text; tool-level failures return caller-visible errors (the agent sees the message).
+
+Add it to an agent config (e.g. pi's `~/.pi/config.*` or Claude Desktop's `claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "email": {
+      "command": "email-learn",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+The same `EMAIL_LEARN_DB` override applies (point multiple agents at the same DB). Lesson *derivation* still happens in the agent session — the server only stores and retrieves.
 
 ## Use it as an agent skill
 
@@ -80,7 +109,6 @@ Then any pi agent can load it by name (`email-voice`) and follow its draft → d
 
 ## Roadmap
 
-- **MCP server** (`email-mcp`) so pi/Claude can call `create_draft` / `finalize` / `query` as tools instead of shelling out to the CLI.
 - **LLM provider** behind `EMAIL_LEARN_LLM` — wire the `LessonSummarizer` seam to ollama / openai / an MCP provider for lesson summarization and `/style-review`-style audits. Lesson *derivation* stays in the agent session either way.
 
 ## License

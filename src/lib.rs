@@ -1,7 +1,10 @@
 // email-learn library: store (draft, final) email pairs, agent-derived voice
 // lessons, and the in-flight drafting surface. Shared by the `email-learn` CLI
-// and the `email-app` Tauri UI. No LLM call from here on purpose — the agent
-// derives lessons in-session against the diffs we surface.
+// (including its MCP server), the `email-app` Tauri UI, and any MCP client.
+// No LLM call from here on purpose — the agent derives lessons in-session
+// against the diffs we surface.
+
+pub mod mcp;
 
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
