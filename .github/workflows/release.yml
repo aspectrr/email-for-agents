@@ -1,0 +1,48 @@
+name: Release macOS
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: # manual trigger from Actions tab
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Rust + both macOS targets for universal binary
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      # Bun for frontend build
+      - uses: oven-sh/setup-bun@v2
+
+      # Install frontend deps before tauri-action runs beforeBuildCommand
+      - name: Install frontend deps
+        run: cd email-app && bun install
+
+      # Build + create release. No code signing — app is unsigned.
+      # Users bypass Gatekeeper: right-click > Open (first time only).
+      - uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: email-app
+          tagName: ${{ github.ref_name }}
+          releaseName: "Email for Agents ${{ github.ref_name }}"
+          releaseBody: |
+            ## Install
+
+            1. Download the `.dmg` below
+            2. Open it, drag **Email for Agents** to Applications
+            3. First launch: right-click the app → **Open** → **Open anyway**
+               (macOS Gatekeeper blocks unsigned apps on first run)
+
+            Requires macOS 11+ (universal binary: Apple Silicon + Intel).
+          releaseDraft: true
+          prerelease: false
+          # Universal binary covers both Apple Silicon and Intel
+          args: --target universal-apple-darwin

@@ -1,85 +1,10 @@
-// email-learn: store (draft, final) email pairs + agent-derived voice lessons in SQLite.
-// ponytail: no LLM API call from the CLI on purpose — the agent reads diffs and
-// derives lessons in-session via the email-voice skill. Upgrade path: add a
-// `derive` subcommand later that shells out to a provider if you want offline runs.
+// email-learn CLI: thin wrapper over the `email_learn` library so both this
+// binary and the `email-app` Tauri UI share one implementation.
 
 use clap::{Parser, Subcommand};
-use rusqlite::{params, Connection};
-use serde::Serialize;
-use similar::{ChangeTag, TextDiff};
+use email_learn as el;
 use std::path::PathBuf;
 use std::process::ExitCode;
-
-const SCHEMA: &str = "
-CREATE TABLE IF NOT EXISTS pairs (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    draft        TEXT NOT NULL,
-    final        TEXT NOT NULL,
-    diff         TEXT NOT NULL,
-    context      TEXT,
-    tags         TEXT,
-    created_at   TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS lessons (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    pair_id      INTEGER REFERENCES pairs(id) ON DELETE SET NULL,
-    lesson       TEXT NOT NULL,
-    tags         TEXT,
-    created_at   TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_pairs_tags ON pairs(tags);
-CREATE INDEX IF NOT EXISTS idx_lessons_tags ON lessons(tags);
-";
-
-fn db_path() -> PathBuf {
-    // ponytail: env override for tests / CI; default to a global shared DB so
-    // voice lessons accumulate across every project on the machine.
-    if let Ok(p) = std::env::var("EMAIL_LEARN_DB") {
-        return PathBuf::from(p);
-    }
-    let mut p = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    p.push(".email-learn");
-    p.push("emails.db");
-    p
-}
-
-fn connect() -> anyhow::Result<Connection> {
-    let p = db_path();
-    if let Some(parent) = p.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let conn = Connection::open(p)?;
-    conn.execute_batch(SCHEMA)?;
-    Ok(conn)
-}
-
-fn now_iso() -> String {
-    chrono::Utc::now().to_rfc3339()
-}
-
-/// Unified-diff-style text. ponytail: line-based; char-level granularity not needed
-/// for prose — upgrade to `diff::chars` if you start diffing one-liners.
-fn unified_diff(old: &str, new: &str) -> String {
-    let diff = TextDiff::from_lines(old, new);
-    let mut out = String::new();
-    for change in diff.iter_all_changes() {
-        let sign = match change.tag() {
-            ChangeTag::Delete => '-',
-            ChangeTag::Insert => '+',
-            ChangeTag::Equal => ' ',
-        };
-        let text = change.value();
-        // trim a trailing newline so signs line up with content
-        out.push(sign);
-        out.push_str(text);
-        if !text.ends_with('\n') {
-            out.push('\n');
-        }
-    }
-    out
-}
 
 #[derive(Parser)]
 #[command(name = "email-learn", version, about = "Store (draft, final) email pairs + voice lessons for agent learning.")]
@@ -94,16 +19,14 @@ enum Cmd {
     Add {
         draft_path: PathBuf,
         final_path: PathBuf,
-        /// Free-form context (topic, recipient type, intent).
         #[arg(long)]
         context: Option<String>,
-        /// Comma-separated tags.
         #[arg(long, value_delimiter = ',')]
         tags: Vec<String>,
     },
-    /// Show one pair (draft, final, diff) for in-session lesson derivation.
+    /// Show one pair (draft, final, diff).
     Show { id: i64 },
-    /// List the N most recent pairs (id, created_at, context, tags, diff).
+    /// List the N most recent pairs.
     #[command(alias = "ls")]
     Recent {
         #[arg(default_value = "10")]
@@ -114,48 +37,133 @@ enum Cmd {
         #[arg(long, value_delimiter = ',')]
         tags: Vec<String>,
     },
-    /// Store a lesson derived from a pair by the agent.
+    /// Store a lesson derived from a pair.
     AddLesson {
         pair_id: i64,
         lesson: String,
         #[arg(long, value_delimiter = ',')]
         tags: Vec<String>,
     },
-    /// Full-text-ish search across pairs (context, tags, final body) and lessons.
+    /// Full-text-ish search across pairs and lessons.
     Query { needle: String },
-    /// Dump everything as markdown for bulk injection into an agent prompt.
+    /// Dump everything as markdown.
     Export,
+
+    /// Summarize/audit stored lessons via the (optional) LLM seam.
+    /// Default noop stub; wire a provider behind EMAIL_LEARN_LLM later.
+    Summarize,
+
+    // --- drafting surface (agent ingest) ---
+    /// Create a new in-flight draft from stdin or a file. Prints the new draft id.
+    /// Agent ingest path: the Tauri UI picks this up for editing.
+    Draft {
+        /// Read draft body from this file; use `-` for stdin.
+        path: PathBuf,
+        #[arg(long)]
+        context: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        tags: Vec<String>,
+        #[arg(long, default_value = "agent")]
+        source: String,
+    },
+    /// Finalize a draft (latest revision vs first → pair). Prints the pair id.
+    Finalize { draft_id: i64 },
+    /// List drafts (add --all to include finalized).
+    Drafts {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Delete a draft and its revisions (a finalized pair, if any, is kept).
+    DeleteDraft { draft_id: i64 },
+    /// Delete a pair. Derived lessons are unlinked (kept), not deleted.
+    DeletePair { pair_id: i64 },
+    /// Delete a single lesson by id.
+    DeleteLesson { lesson_id: i64 },
+    /// Run as an MCP server over stdio. Agents (pi, Claude, …) connect to this
+    /// and get every CLI feature as tools: read pairs/diffs/lessons, record
+    /// derived lessons, push and edit drafts, search.
+    Mcp,
+
+    // --- lint ---
+    /// Scan a draft (or raw text) against stored voice patterns.
+    /// Prints violations as JSON. Key write-loop entry point.
+    Lint {
+        /// Draft id to lint (uses latest revision content). Mutually exclusive with --text.
+        draft_id: Option<i64>,
+        #[arg(long)]
+        text: Option<String>,
+    },
+    /// Add a matchable voice pattern for the lint engine.
+    AddPattern {
+        #[arg(long)]
+        rule: String,
+        #[arg(long)]
+        pattern: String,
+        #[arg(long, default_value = "literal")]
+        pattern_type: String,
+        #[arg(long, default_value = "avoid")]
+        direction: String,
+        #[arg(long, default_value = "style")]
+        category: String,
+        #[arg(long)]
+        lesson_id: Option<i64>,
+        #[arg(long)]
+        before: Option<String>,
+        #[arg(long)]
+        after: Option<String>,
+    },
+    /// List stored voice patterns (optionally filtered by lesson).
+    ListPatterns {
+        #[arg(long)]
+        lesson_id: Option<i64>,
+    },
+    /// Delete a pattern by id.
+    DeletePattern { pattern_id: i64 },
+    /// Analyze a finalized pair's diff: surface deletions, additions, word
+    /// swaps, and existing-pattern hits. Data for deriving new patterns.
+    Analyze { pair_id: i64 },
+
+    // --- feedback ---
+    /// Log feedback (from an agent or human) about the tool.
+    Feedback {
+        message: String,
+        #[arg(long)]
+        tool: Option<String>,
+        #[arg(long, default_value = "info")]
+        severity: String,
+        #[arg(long)]
+        rating: Option<i64>,
+    },
+    /// List all feedback entries.
+    FeedbackList,
+    /// Manually trigger pattern promotion. Scans all pairs, auto-promotes
+    /// patterns with 3+ draft occurrences to 'confirmed'.
+    Promote,
 }
 
-#[derive(Serialize)]
-struct Pair {
-    id: i64,
-    draft: String,
-    final_: String,
-    diff: String,
-    context: Option<String>,
-    tags: Vec<String>,
-    created_at: String,
-}
-
-#[derive(Serialize)]
-struct Lesson {
-    id: i64,
-    pair_id: Option<i64>,
-    lesson: String,
-    tags: Vec<String>,
-    created_at: String,
-}
-
-fn parse_tags(s: Option<&str>) -> Vec<String> {
-    match s {
-        None | Some("") => Vec::new(),
-        Some(t) => serde_json::from_str::<Vec<String>>(t).unwrap_or_default(),
+fn read_text(path: &PathBuf) -> anyhow::Result<String> {
+    if path == std::path::Path::new("-") {
+        use std::io::Read;
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        Ok(s)
+    } else {
+        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("read {}: {e}", path.display()))
     }
 }
 
-fn tags_to_json(tags: &[String]) -> String {
-    serde_json::to_string(tags).unwrap_or_else(|_| "[]".into())
+/// Render a pair as JSON with a readable plain diff (the stored `diff` field is
+/// structured JSON for the UI; the CLI surfaces plain text for humans/agents).
+fn pair_json(p: &el::Pair) -> serde_json::Value {
+    serde_json::json!({
+        "id": p.id,
+        "draft": p.draft,
+        "final": p.final_,
+        "diff": el::render_diff_plain(&el::rich_diff(&p.draft, &p.final_)),
+        "context": p.context,
+        "tags": p.tags,
+        "created_at": p.created_at,
+    })
 }
 
 fn main() -> ExitCode {
@@ -170,181 +178,145 @@ fn main() -> ExitCode {
 
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let conn = connect()?;
+    let conn = el::connect()?;
     match cli.cmd {
         Cmd::Add { draft_path, final_path, context, tags } => {
-            let draft = std::fs::read_to_string(&draft_path)
-                .map_err(|e| anyhow::anyhow!("read draft {}: {e}", draft_path.display()))?;
-            let final_ = std::fs::read_to_string(&final_path)
-                .map_err(|e| anyhow::anyhow!("read final {}: {e}", final_path.display()))?;
-            let diff = unified_diff(&draft, &final_);
-            let tags_json = tags_to_json(&tags);
-            let now = now_iso();
-            conn.execute(
-                "INSERT INTO pairs (draft, final, diff, context, tags, created_at) VALUES (?1,?2,?3,?4,?5,?6)",
-                params![draft, final_, diff, context, tags_json, now],
-            )?;
-            let id = conn.last_insert_rowid();
+            let draft = read_text(&draft_path)?;
+            let final_ = read_text(&final_path)?;
+            let id = el::add_pair(&conn, &draft, &final_, context.as_deref(), &tags)?;
             println!("{id}");
-            Ok(())
         }
-        Cmd::Show { id } => {
-            let mut stmt = conn.prepare("SELECT id, draft, final, diff, context, tags, created_at FROM pairs WHERE id = ?1")?;
-            let mut rows = stmt.query(params![id])?;
-            if let Some(r) = rows.next()? {
-                let tags: Vec<String> = parse_tags(r.get::<_, Option<String>>(5)?.as_deref());
-                let p = Pair {
-                    id: r.get(0)?,
-                    draft: r.get(1)?,
-                    final_: r.get(2)?,
-                    diff: r.get(3)?,
-                    context: r.get(4)?,
-                    tags,
-                    created_at: r.get(6)?,
-                };
-                println!("{}", serde_json::to_string_pretty(&p)?);
-            } else {
-                eprintln!("no pair with id {id}");
-            }
-            Ok(())
-        }
+        Cmd::Show { id } => match el::show_pair(&conn, id)? {
+            Some(p) => println!("{}", serde_json::to_string_pretty(&pair_json(&p))?),
+            None => eprintln!("no pair with id {id}"),
+        },
         Cmd::Recent { n } => {
-            let mut stmt = conn.prepare("SELECT id, draft, final, diff, context, tags, created_at FROM pairs ORDER BY id DESC LIMIT ?1")?;
-            let mut out = Vec::new();
-            let rows = stmt.query_map(params![n as i64], |r| {
-                let tags: Vec<String> = parse_tags(r.get::<_, Option<String>>(5)?.as_deref());
-                Ok(Pair {
-                    id: r.get(0)?,
-                    draft: r.get(1)?,
-                    final_: r.get(2)?,
-                    diff: r.get(3)?,
-                    context: r.get(4)?,
-                    tags,
-                    created_at: r.get(6)?,
-                })
-            })?;
-            for r in rows { out.push(r?); }
+            let out: Vec<_> = el::recent_pairs(&conn, n)?.iter().map(pair_json).collect();
             println!("{}", serde_json::to_string_pretty(&out)?);
-            Ok(())
         }
         Cmd::Lessons { tags } => {
-            // ponytail: per-tag LIKE (any-match). Upgrade to FTS5 / json_each if scale demands.
-            let mut out: Vec<Lesson> = Vec::new();
-            if tags.is_empty() {
-                let mut stmt = conn.prepare("SELECT id, pair_id, lesson, tags, created_at FROM lessons ORDER BY id DESC")?;
-                let rows = stmt.query_map([], |r| {
-                    let t: Vec<String> = parse_tags(r.get::<_, Option<String>>(3)?.as_deref());
-                    Ok(Lesson { id: r.get(0)?, pair_id: r.get(1)?, lesson: r.get(2)?, tags: t, created_at: r.get(4)? })
-                })?;
-                for x in rows { out.push(x?); }
-            } else {
-                let pats: Vec<String> = tags.iter().map(|t| format!("%\"{}\"%", t.replace('"', "\\\""))).collect();
-                let placeholders = (0..pats.len()).map(|_| "tags LIKE ?").collect::<Vec<_>>().join(" OR ");
-                let sql = format!("SELECT id, pair_id, lesson, tags, created_at FROM lessons WHERE {placeholders} ORDER BY id DESC");
-                let mut stmt = conn.prepare(&sql)?;
-                let refs: Vec<&dyn rusqlite::ToSql> = pats.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
-                let rows = stmt.query_map(refs.as_slice(), |r| {
-                    let t: Vec<String> = parse_tags(r.get::<_, Option<String>>(3)?.as_deref());
-                    Ok(Lesson { id: r.get(0)?, pair_id: r.get(1)?, lesson: r.get(2)?, tags: t, created_at: r.get(4)? })
-                })?;
-                for x in rows { out.push(x?); }
-            }
-            let s = serde_json::to_string_pretty(&out)?;
-            println!("{s}");
-            Ok(())
+            let out = el::lessons(&conn, &tags)?;
+            println!("{}", serde_json::to_string_pretty(&out)?);
         }
         Cmd::AddLesson { pair_id, lesson, tags } => {
-            let tags_json = tags_to_json(&tags);
-            let now = now_iso();
-            conn.execute(
-                "INSERT INTO lessons (pair_id, lesson, tags, created_at) VALUES (?1,?2,?3,?4)",
-                params![pair_id, lesson, tags_json, now],
-            )?;
-            println!("{}", conn.last_insert_rowid());
-            Ok(())
+            let id = el::add_lesson(&conn, pair_id, &lesson, &tags)?;
+            println!("{id}");
         }
         Cmd::Query { needle } => {
-            let pat = format!("%{needle}%");
-            let mut pairs: Vec<Pair> = Vec::new();
-            {
-                let mut stmt = conn.prepare(
-                    "SELECT id, draft, final, diff, context, tags, created_at FROM pairs
-                     WHERE context LIKE ?1 OR tags LIKE ?1 OR final LIKE ?1 OR draft LIKE ?1
-                     ORDER BY id DESC LIMIT 50"
-                )?;
-                let rows = stmt.query_map(params![pat], |r| {
-                    let tags: Vec<String> = parse_tags(r.get::<_, Option<String>>(5)?.as_deref());
-                    Ok(Pair { id: r.get(0)?, draft: r.get(1)?, final_: r.get(2)?, diff: r.get(3)?, context: r.get(4)?, tags, created_at: r.get(6)? })
-                })?;
-                for x in rows { pairs.push(x?); }
-            }
-            let mut lessons: Vec<Lesson> = Vec::new();
-            {
-                let mut stmt = conn.prepare(
-                    "SELECT id, pair_id, lesson, tags, created_at FROM lessons
-                     WHERE lesson LIKE ?1 OR tags LIKE ?1 ORDER BY id DESC LIMIT 50"
-                )?;
-                let rows = stmt.query_map(params![pat], |r| {
-                    let t: Vec<String> = parse_tags(r.get::<_, Option<String>>(3)?.as_deref());
-                    Ok(Lesson { id: r.get(0)?, pair_id: r.get(1)?, lesson: r.get(2)?, tags: t, created_at: r.get(4)? })
-                })?;
-                for x in rows { lessons.push(x?); }
-            }
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "pairs": pairs,
-                "lessons": lessons,
-            }))?);
-            Ok(())
+            let (pairs, lessons) = el::query(&conn, &needle)?;
+            let pairs: Vec<_> = pairs.iter().map(pair_json).collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "pairs": pairs,
+                    "lessons": lessons,
+                }))?
+            );
         }
         Cmd::Export => {
-            let mut pairs: Vec<Pair> = Vec::new();
-            {
-                let mut stmt = conn.prepare("SELECT id, draft, final, diff, context, tags, created_at FROM pairs ORDER BY id ASC")?;
-                let rows = stmt.query_map([], |r| {
-                    let tags: Vec<String> = parse_tags(r.get::<_, Option<String>>(5)?.as_deref());
-                    Ok(Pair { id: r.get(0)?, draft: r.get(1)?, final_: r.get(2)?, diff: r.get(3)?, context: r.get(4)?, tags, created_at: r.get(6)? })
-                })?;
-                for x in rows { pairs.push(x?); }
-            }
-            let mut lessons: Vec<Lesson> = Vec::new();
-            {
-                let mut stmt = conn.prepare("SELECT id, pair_id, lesson, tags, created_at FROM lessons ORDER BY id ASC")?;
-                let rows = stmt.query_map([], |r| {
-                    let t: Vec<String> = parse_tags(r.get::<_, Option<String>>(3)?.as_deref());
-                    Ok(Lesson { id: r.get(0)?, pair_id: r.get(1)?, lesson: r.get(2)?, tags: t, created_at: r.get(4)? })
-                })?;
-                for x in rows { lessons.push(x?); }
-            }
+            print!("{}", el::export_md(&conn)?);
+        }
 
-            let mut md = String::new();
-            md.push_str("# Voice Lessons (exported)\n\n");
-            md.push_str("## Lessons\n\n");
-            if lessons.is_empty() {
-                md.push_str("_(none yet)_\n\n");
+        Cmd::Summarize => {
+            print!("{}", el::summarize_lessons(&conn)?);
+        }
+
+        Cmd::Draft { path, context, tags, source } => {
+            let body = read_text(&path)?;
+            let ctx = el::create_draft_with_context(&conn, &body, context.as_deref(), &tags, &source)?;
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "draft_id": ctx.draft_id,
+                "patterns": ctx.patterns,
+                "violations": ctx.violations,
+            }))?);
+        }
+        Cmd::Finalize { draft_id } => {
+            let result = el::finalize_draft_with_analysis(&conn, draft_id)?;
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "pair_id": result.pair_id,
+                "analysis": result.analysis,
+                "promoted_patterns": result.promoted_patterns,
+            }))?);
+        }
+        Cmd::Drafts { all } => {
+            let out = el::list_drafts(&conn, all)?;
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        Cmd::DeleteDraft { draft_id } => {
+            el::delete_draft(&conn, draft_id)?;
+            println!("deleted draft {draft_id}");
+        }
+        Cmd::DeletePair { pair_id } => {
+            el::delete_pair(&conn, pair_id)?;
+            println!("deleted pair {pair_id}");
+        }
+        Cmd::DeleteLesson { lesson_id } => {
+            el::delete_lesson(&conn, lesson_id)?;
+            println!("deleted lesson {lesson_id}");
+        }
+
+        Cmd::Lint { draft_id, text } => {
+            let content = if let Some(t) = text {
+                t
+            } else if let Some(id) = draft_id {
+                match el::get_draft(&conn, id)? {
+                    Some(d) => d.revisions.last().map(|r| r.content.clone())
+                        .unwrap_or_default(),
+                    None => anyhow::bail!("no draft with id {id}"),
+                }
+            } else {
+                anyhow::bail!("provide a draft id or --text");
+            };
+            let violations = el::lint_draft(&conn, &content)?;
+            println!("{}", serde_json::to_string_pretty(&violations)?);
+        }
+        Cmd::AddPattern { rule, pattern, pattern_type, direction, category, lesson_id, before, after } => {
+            let id = el::add_pattern(
+                &conn, lesson_id, &rule, &pattern, &pattern_type, &direction, &category,
+                before.as_deref(), after.as_deref(),
+            )?;
+            println!("{id}");
+        }
+        Cmd::ListPatterns { lesson_id } => {
+            let out = el::list_patterns(&conn, lesson_id)?;
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        Cmd::DeletePattern { pattern_id } => {
+            el::delete_pattern(&conn, pattern_id)?;
+            println!("deleted pattern {pattern_id}");
+        }
+        Cmd::Analyze { pair_id } => {
+            match el::analyze_diff(&conn, pair_id)? {
+                Some(a) => println!("{}", serde_json::to_string_pretty(&a)?),
+                None => eprintln!("no pair with id {pair_id}"),
             }
-            for l in &lessons {
-                md.push_str(&format!("- **L{}** (pair #{}) {}: {}  _{}_\n",
-                    l.id, l.pair_id.map(|i| i.to_string()).unwrap_or_else(|| "—".into()),
-                    l.tags.join(","), l.lesson, l.created_at));
+        }
+        Cmd::Feedback { message, tool, severity, rating } => {
+            let id = el::add_feedback(&conn, tool.as_deref(), &message, &severity, rating, None)?;
+            println!("{id}");
+        }
+        Cmd::FeedbackList => {
+            let out = el::list_feedback(&conn)?;
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        Cmd::Promote => {
+            let promoted = el::promote_patterns(&conn)?;
+            if promoted.is_empty() {
+                println!("No patterns promoted.");
+            } else {
+                for (id, rule, count, pairs) in &promoted {
+                    println!("promoted #{id} \"{rule}\" — {count} occurrences in pairs {:?}", pairs);
+                }
             }
-            md.push_str("\n## Pairs\n\n");
-            for p in &pairs {
-                md.push_str(&format!("### Pair #{} — {}\n", p.id, p.created_at));
-                if let Some(c) = &p.context { md.push_str(&format!("context: {c}\n")); }
-                if !p.tags.is_empty() { md.push_str(&format!("tags: {}\n", p.tags.join(", "))); }
-                md.push_str("\n#### Draft\n```\n");
-                md.push_str(&p.draft);
-                if !p.draft.ends_with('\n') { md.push('\n'); }
-                md.push_str("```\n#### Final\n```\n");
-                md.push_str(&p.final_);
-                if !p.final_.ends_with('\n') { md.push('\n'); }
-                md.push_str("```\n#### Diff\n```diff\n");
-                md.push_str(&p.diff);
-                if !p.diff.ends_with('\n') { md.push('\n'); }
-                md.push_str("```\n\n");
-            }
-            println!("{md}");
-            Ok(())
+        }
+        Cmd::Mcp => {
+            // The MCP server speaks JSON-RPC over stdio and needs the tokio
+            // runtime. Every other subcommand stays synchronous.
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?
+                .block_on(el::mcp::serve())?;
         }
     }
+    Ok(())
 }
