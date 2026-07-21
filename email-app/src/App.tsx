@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, parseDiff } from "./lib/api";
-import type { Draft, DraftWithRevisions, DiffRow, Lesson, Pair, SearchResult } from "./lib/api";
+import type { Draft, DraftWithRevisions, DiffRow, Lesson, Pair, SearchResult, Pattern, Violation, Feedback } from "./lib/api";
 import "./App.css";
 
-type View = "drafts" | "library" | "search" | "lessons";
-type RightTab = "diff" | "revisions" | "lessons";
+type View = "drafts" | "library" | "search" | "lessons" | "patterns" | "feedback";
+type RightTab = "diff" | "revisions" | "lessons" | "lint";
 
 export default function App() {
   const [view, setView] = useState<View>("drafts");
@@ -31,6 +31,12 @@ export default function App() {
   // search
   const [q, setQ] = useState("");
   const [results, setResults] = useState<SearchResult | null>(null);
+
+  // lint + patterns + feedback
+  const [violations, setViolations] = useState<Violation[]>([]);
+  const [linting, setLinting] = useState(false);
+  const [patterns, setPatterns] = useState<Pattern[]>([]);
+  const [feedback, setFeedback] = useState<Feedback[]>([]);
 
   const flushError = (e: unknown) => setError(e instanceof Error ? e.message : String(e));
 
@@ -190,6 +196,23 @@ export default function App() {
     try { setResults(await api.search(q)); } catch (e) { flushError(e); }
   };
 
+  const runLint = async (content: string) => {
+    setLinting(true);
+    try { setViolations(await api.lintDraft(content)); } catch (e) { flushError(e); }
+    finally { setLinting(false); }
+  };
+
+  const reloadPatterns = useCallback(async () => {
+    try { setPatterns(await api.listPatterns()); } catch (e) { flushError(e); }
+  }, []);
+
+  const reloadFeedback = useCallback(async () => {
+    try { setFeedback(await api.listFeedback()); } catch (e) { flushError(e); }
+  }, []);
+
+  useEffect(() => { if (view === "patterns") reloadPatterns(); }, [view, reloadPatterns]);
+  useEffect(() => { if (view === "feedback") reloadFeedback(); }, [view, reloadFeedback]);
+
   const openPair = async (id: number) => {
     try { setSelectedPair(await api.showPair(id)); } catch (e) { flushError(e); }
   };
@@ -203,6 +226,8 @@ export default function App() {
           <button className={view === "library" ? "active" : ""} onClick={() => setView("library")}>Library</button>
           <button className={view === "search" ? "active" : ""} onClick={() => setView("search")}>Search</button>
           <button className={view === "lessons" ? "active" : ""} onClick={() => setView("lessons")}>Lessons</button>
+          <button className={view === "patterns" ? "active" : ""} onClick={() => setView("patterns")}>Patterns</button>
+          <button className={view === "feedback" ? "active" : ""} onClick={() => setView("feedback")}>Feedback</button>
         </nav>
         {view === "search" && (
           <div className="search-inline">
@@ -280,10 +305,18 @@ export default function App() {
             <div className="right-tabs">
               <button className={rightTab === "diff" ? "active" : ""} onClick={() => setRightTab("diff")}>Diff</button>
               <button className={rightTab === "revisions" ? "active" : ""} onClick={() => setRightTab("revisions")}>Revisions</button>
+              <button className={rightTab === "lint" ? "active" : ""} onClick={() => { setRightTab("lint"); if (current) runLint(editorText); }}>Lint</button>
               <button className={rightTab === "lessons" ? "active" : ""} onClick={() => setRightTab("lessons")}>Lessons</button>
             </div>
             <div className="right-body">
-              {rightTab === "diff" && current && <DiffPane diff={current.working_diff} />}
+              {rightTab === "diff" && current && (
+                <DiffPane diff={current.working_diff}
+                  oldText={current.revisions[0]?.content}
+                  newText={current.revisions[current.revisions.length - 1]?.content} />
+              )}
+              {rightTab === "lint" && current && (
+                <LintPane violations={violations} linting={linting} onRelint={() => runLint(editorText)} />
+              )}
               {rightTab === "revisions" && current && (
                 <RevisionsPane revisions={current.revisions} onRestore={restore} />
               )}
@@ -368,19 +401,51 @@ export default function App() {
           )}
         </div>
       )}
+
+      {view === "patterns" && (
+        <PatternsView patterns={patterns} onChanged={reloadPatterns} />
+      )}
+
+      {view === "feedback" && (
+        <FeedbackView feedback={feedback} />
+      )}
     </div>
   );
 }
 
-function DiffPane({ diff }: { diff: string }) {
-  const rows = parseDiff(diff);
+function DiffPane({ diff, oldText, newText }: { diff: string; oldText?: string; newText?: string }) {
+  const [mode, setMode] = useState<"lines" | "sentences">("lines");
+  const [sentenceDiff, setSentenceDiff] = useState<string>("");
+
+  useEffect(() => {
+    if (mode === "sentences" && oldText != null && newText != null) {
+      api.computeDiff(oldText, newText, "sentences").then(setSentenceDiff).catch(() => setSentenceDiff(""));
+    }
+  }, [mode, oldText, newText]);
+
+  const activeDiff = mode === "sentences" ? sentenceDiff : diff;
+  const rows = parseDiff(activeDiff);
   if (!rows.some(r => r.kind !== "equal")) {
-    return <div className="empty small">No changes yet — the editor matches the original draft.</div>;
+    return (
+      <div className="diff-pane">
+        <div className="diff-mode">
+          <button className={mode === "lines" ? "active" : ""} onClick={() => setMode("lines")}>lines</button>
+          <button className={mode === "sentences" ? "active" : ""} onClick={() => setMode("sentences")}>sentences</button>
+        </div>
+        <div className="empty small">No changes yet — the editor matches the original draft.</div>
+      </div>
+    );
   }
   return (
-    <pre className="diff">
-      {rows.map((row, i) => <DiffLine key={i} row={row} />)}
-    </pre>
+    <div className="diff-pane">
+      <div className="diff-mode">
+        <button className={mode === "lines" ? "active" : ""} onClick={() => setMode("lines")}>lines</button>
+        <button className={mode === "sentences" ? "active" : ""} onClick={() => setMode("sentences")}>sentences</button>
+      </div>
+      <pre className="diff">
+        {rows.map((row, i) => <DiffLine key={i} row={row} />)}
+      </pre>
+    </div>
   );
 }
 
@@ -504,7 +569,7 @@ function PairDetail({ pair, onDelete }: { pair: Pair; onDelete: (id: number) => 
         <div><h4>Final</h4><pre>{pair.final}</pre></div>
       </div>
       <h4>Diff</h4>
-      <DiffPane diff={pair.diff} />
+      <DiffPane diff={pair.diff} oldText={pair.draft} newText={pair.final} />
     </div>
   );
 }
@@ -521,4 +586,146 @@ function shortWhen(iso: string): string {
 function truncate(s: string, n: number): string {
   s = s.replace(/\s+/g, " ").trim();
   return s.length > n ? s.slice(0, n) + "…" : s;
+}
+
+// --- lint panel (drafts right-pane) ---
+
+function LintPane({ violations, linting, onRelint }: {
+  violations: Violation[]; linting: boolean; onRelint: () => void;
+}) {
+  return (
+    <div className="lint-pane">
+      <div className="lint-head">
+        <strong>{violations.length} violation(s)</strong>
+        <button className="mini" onClick={onRelint} disabled={linting}>
+          {linting ? "linting…" : "re-lint"}
+        </button>
+      </div>
+      {violations.length === 0 ? (
+        <div className="empty small">
+          {linting ? "Checking…" : "No violations. Draft matches all stored patterns."}
+        </div>
+      ) : (
+        <ul className="violation-list">
+          {violations.map((v, i) => (
+            <li key={i} className={"violation " + v.category}>
+              <div className="v-rule">⚠ {v.rule}</div>
+              {v.matched_text && <div className="v-match">"{v.matched_text}" — line {v.line}</div>}
+              <div className="v-ctx">{v.context}</div>
+              <div className="v-meta">[{v.category}] {v.direction}</div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+// --- patterns management view ---
+
+function PatternsView({ patterns, onChanged }: {
+  patterns: Pattern[]; onChanged: () => void;
+}) {
+  const [rule, setRule] = useState("");
+  const [pattern, setPattern] = useState("");
+  const [patternType, setPatternType] = useState("literal");
+  const [direction, setDirection] = useState("avoid");
+  const [category, setCategory] = useState("style");
+
+  const add = async () => {
+    if (!rule.trim() || !pattern.trim()) return;
+    await api.addPattern(rule.trim(), pattern.trim(), patternType, direction, category, null, null, null);
+    setRule(""); setPattern("");
+    onChanged();
+  };
+
+  const del = async (id: number) => {
+    await api.deletePattern(id);
+    onChanged();
+  };
+
+  return (
+    <div className="search-layout">
+      <section className="pattern-list-section">
+        <h3>Voice patterns ({patterns.length})</h3>
+        <p className="hint">Patterns are matchable rules the lint engine checks drafts against.
+        Literal matches are case-insensitive substring searches. Regex uses Rust regex syntax.</p>
+        <ul className="pattern-list">
+          {patterns.map(p => (
+            <li key={p.id}>
+              <div className="pattern-row">
+                <div className="pattern-text">
+                  <div><strong>{p.rule}</strong></div>
+                  <div className="pattern-meta">
+                    <code>{p.pattern}</code> · {p.pattern_type} · {p.direction} · [{p.category}] · {p.confidence}
+                  </div>
+                  {p.before_text && p.after_text && (
+                    <div className="pattern-ex">
+                      <span className="del">{p.before_text}</span> → <span className="add">{p.after_text}</span>
+                    </div>
+                  )}
+                </div>
+                <ConfirmButton label="Delete" confirmLabel="Confirm" danger onConfirm={() => del(p.id)} />
+              </div>
+            </li>
+          ))}
+          {patterns.length === 0 && <li className="empty">No patterns yet. Add one below — it will immediately lint future drafts.</li>}
+        </ul>
+      </section>
+      <section className="add-pattern-section">
+        <h3>Add pattern</h3>
+        <input value={rule} onChange={e => setRule(e.target.value)} placeholder="Rule: e.g. No em-dashes in client emails" />
+        <input value={pattern} onChange={e => setPattern(e.target.value)} placeholder="Pattern: e.g. — or \b—\b" />
+        <div className="pattern-opts">
+          <select value={patternType} onChange={e => setPatternType(e.target.value)}>
+            <option value="literal">literal</option>
+            <option value="regex">regex</option>
+          </select>
+          <select value={direction} onChange={e => setDirection(e.target.value)}>
+            <option value="avoid">avoid</option>
+            <option value="prefer">prefer</option>
+          </select>
+          <select value={category} onChange={e => setCategory(e.target.value)}>
+            <option value="style">style</option>
+            <option value="punctuation">punctuation</option>
+            <option value="structure">structure</option>
+            <option value="factual">factual</option>
+            <option value="deletion">deletion</option>
+          </select>
+          <button className="primary" onClick={add} disabled={!rule.trim() || !pattern.trim()}>Add</button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+// --- feedback view ---
+
+function FeedbackView({ feedback }: { feedback: Feedback[] }) {
+  return (
+    <div className="search-layout">
+      <section>
+        <h3>Feedback ({feedback.length})</h3>
+        <p className="hint">Agents log feedback via the <code>give_feedback</code> MCP tool or <code>email-learn feedback</code> CLI command.</p>
+        {feedback.length === 0 ? (
+          <div className="empty">No feedback yet.</div>
+        ) : (
+          <ul className="feedback-list">
+            {feedback.map(f => (
+              <li key={f.id} className={"feedback-item " + f.severity}>
+                <div className="fb-head">
+                  <span className={"sev " + f.severity}>{f.severity}</span>
+                  {f.tool_name && <span className="fb-tool">{f.tool_name}</span>}
+                  {f.rating != null && <span className="fb-rating">{"★".repeat(f.rating)}{"☆".repeat(5 - f.rating)}</span>}
+                  <span className="when">{shortWhen(f.created_at)}</span>
+                </div>
+                <div className="fb-msg">{f.message}</div>
+                {f.agent_id && <div className="fb-agent">from: {f.agent_id}</div>}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    </div>
+  );
 }

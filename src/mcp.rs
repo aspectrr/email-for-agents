@@ -156,6 +156,66 @@ struct UpdateDraftMetaParams {
     tags: Option<Vec<String>>,
 }
 
+// --- lint params ---
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct LintParams {
+    /// Draft id to lint (uses latest revision content). If omitted, pass `content`.
+    draft_id: Option<i64>,
+    /// Raw text to lint directly. Used when draft_id is omitted.
+    content: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct AddPatternParams {
+    /// Human-readable rule: "No em-dashes in client emails"
+    rule: String,
+    /// The match string: literal text or regex pattern.
+    pattern: String,
+    /// "literal" (default) or "regex".
+    #[serde(default = "default_literal")]
+    pattern_type: String,
+    /// "avoid" (default — flag if found) or "prefer" (flag if absent).
+    #[serde(default = "default_avoid")]
+    direction: String,
+    /// "punctuation", "style", "structure", "factual", "deletion". Default: "style".
+    #[serde(default = "default_style")]
+    category: String,
+    /// Link to an existing lesson (optional).
+    lesson_id: Option<i64>,
+    /// Example before-text (optional, for agent context).
+    before_text: Option<String>,
+    /// Example after-text (optional, for agent context).
+    after_text: Option<String>,
+}
+
+fn default_literal() -> String { "literal".into() }
+fn default_avoid() -> String { "avoid".into() }
+fn default_style() -> String { "style".into() }
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct AnalyzeParams {
+    /// The pair to analyze.
+    pair_id: i64,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct FeedbackParams {
+    /// Free-text feedback message.
+    message: String,
+    /// Which tool/command the feedback is about (optional).
+    tool_name: Option<String>,
+    /// "info", "warning", "error", "suggestion". Default: "info".
+    #[serde(default = "default_info")]
+    severity: String,
+    /// 1-5 rating (optional).
+    rating: Option<i64>,
+    /// Which agent is reporting (optional).
+    agent_id: Option<String>,
+}
+
+fn default_info() -> String { "info".into() }
+
 // ---------- tools ----------
 
 #[tool_router]
@@ -376,6 +436,94 @@ impl EmailServer {
             Ok(ok_json(serde_json::json!({ "updated": true, "draft_id": p.draft_id })))
         })
     }
+
+    // --- lint (the write loop: stored patterns → draft violations) ---
+
+    /// Scan draft content against all stored voice patterns. This is the
+    /// single highest-leverage tool — it makes stored lessons actually do
+    /// something. Call before showing a draft to the user.
+    #[tool(description = "Lint draft content against stored voice patterns. Pass draft_id to lint a draft's latest revision, or pass raw content directly. Returns violations for 'avoid' patterns that matched and suggestions for 'prefer' patterns that were absent.")]
+    fn lint(&self, Parameters(p): Parameters<LintParams>) -> ToolResult {
+        tool_op(|conn| {
+            let content = if let Some(id) = p.draft_id {
+                match el::get_draft(conn, id)? {
+                    Some(d) => d.revisions.last().map(|r| r.content.clone())
+                        .unwrap_or_default(),
+                    None => return Ok(err_text(format!("no draft with id {id}"))),
+                }
+            } else if let Some(c) = p.content {
+                c
+            } else {
+                return Ok(err_text("pass either draft_id or content".to_string()));
+            };
+            let violations = el::lint_draft(conn, &content)?;
+            Ok(ok_json(serde_json::json!({ "violation_count": violations.len(), "violations": violations })))
+        })
+    }
+
+    /// Add a matchable voice pattern the lint engine will check drafts against.
+    #[tool(description = "Add a matchable voice pattern for the lint engine. pattern_type is 'literal' or 'regex'. direction is 'avoid' (flag if found) or 'prefer' (flag if absent). Returns the new pattern id.")]
+    fn add_pattern(&self, Parameters(p): Parameters<AddPatternParams>) -> ToolResult {
+        tool_op(|conn| {
+            let id = el::add_pattern(
+                conn, p.lesson_id, &p.rule, &p.pattern, &p.pattern_type,
+                &p.direction, &p.category, p.before_text.as_deref(), p.after_text.as_deref(),
+            )?;
+            Ok(ok_json(serde_json::json!({ "pattern_id": id })))
+        })
+    }
+
+    /// List stored voice patterns.
+    #[tool(description = "List all stored voice patterns, or filter by lesson_id.")]
+    fn list_patterns(&self, Parameters(p): Parameters<IdParams>) -> ToolResult {
+        tool_op(|conn| {
+            // IdParams.id used as optional lesson_id filter here; 0 = all
+            let lesson_id = if p.id > 0 { Some(p.id) } else { None };
+            let patterns = el::list_patterns(conn, lesson_id)?;
+            Ok(ok_json(serde_json::json!({ "patterns": patterns })))
+        })
+    }
+
+    /// Delete a pattern by id.
+    #[tool(description = "Delete a voice pattern by id.")]
+    fn delete_pattern(&self, Parameters(p): Parameters<IdParams>) -> ToolResult {
+        tool_op(|conn| {
+            el::delete_pattern(conn, p.id)?;
+            Ok(ok_json(serde_json::json!({ "deleted": true, "pattern_id": p.id })))
+        })
+    }
+
+    /// Analyze a finalized pair's diff: surface deletions, additions, word
+    /// swaps, and existing-pattern hits. Data for deriving candidate patterns.
+    #[tool(description = "Analyze a pair's diff to surface deletions, additions, word-level swaps, and existing pattern hits. Use this to derive candidate voice patterns instead of manual archaeology over a raw diff.")]
+    fn analyze_diff(&self, Parameters(p): Parameters<AnalyzeParams>) -> ToolResult {
+        tool_op(|conn| match el::analyze_diff(conn, p.pair_id)? {
+            Some(a) => Ok(ok_json(serde_json::json!({ "analysis": a }))),
+            None => Ok(err_text(format!("no pair with id {}", p.pair_id))),
+        })
+    }
+
+    // --- feedback (agents and humans can log issues) ---
+
+    /// Log feedback about the tool — bugs, suggestions, confusion points.
+    #[tool(description = "Log feedback about the email-learn tool. Accepts a free-text message, optional tool_name, severity (info/warning/error/suggestion), and 1-5 rating. This is how agents report what's painful.")]
+    fn give_feedback(&self, Parameters(p): Parameters<FeedbackParams>) -> ToolResult {
+        tool_op(|conn| {
+            let id = el::add_feedback(
+                conn, p.tool_name.as_deref(), &p.message, &p.severity, p.rating, p.agent_id.as_deref(),
+            )?;
+            Ok(ok_json(serde_json::json!({ "feedback_id": id })))
+        })
+    }
+
+    /// List all feedback entries.
+    #[tool(description = "List all feedback entries, newest first.")]
+    fn list_feedback(&self) -> ToolResult {
+        tool_op(|conn| {
+            let fb = el::list_feedback(conn)?;
+            Ok(ok_json(serde_json::json!({ "feedback": fb })))
+        })
+    }
 }
 
 // ---------- ServerHandler ----------
@@ -393,13 +541,17 @@ impl ServerHandler for EmailServer {
         .with_instructions(
             "email-learn: a local library that teaches agents to write in the user's voice \
              by learning from (draft → final) email revision pairs.\n\
-             \nThe loop: create_draft (agent writes) → the user edits in the app → \
-             finalize_draft stores the (original → final) diff as a pair → the agent reads \
-             show_pair, derives a concrete voice lesson, and stores it with add_lesson. \
-             Before drafting, call list_lessons / query / export to load what's already been \
-             learned.\n\
-             \nLesson derivation happens in YOUR session — this server only stores and \
-             retrieves. One DB is shared by this server, the `email-learn` CLI, and the Tauri app."
+             \nThe loop: create_draft (agent writes) → lint against stored patterns → \
+             the user edits in the app → finalize_draft stores the (original → final) diff \
+             as a pair → analyze_diff surfaces deletions/additions/word-swaps for lesson \
+             derivation → the agent stores a voice lesson with add_lesson and a matchable \
+             pattern with add_pattern. Before drafting, call list_lessons / list_patterns / \
+             lint to load and apply what's already been learned.\n\
+             \nLint is the write loop: stored patterns actually do something. Call lint \
+             before showing a draft to the user. Give feedback with give_feedback \
+             if anything is painful.\n\
+             \nLesson derivation stays in YOUR session — this server only stores and \
+             retrieves. One DB is shared by this server, the CLI, and the Tauri app."
                 .to_string(),
         )
     }

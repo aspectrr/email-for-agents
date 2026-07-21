@@ -23,6 +23,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1"
+regex = "1"
 
 # MCP server (the `mcp` subcommand). rmcp is the official Rust MCP SDK;
 # transport-io enables the stdio transport agents launch over.

@@ -130,6 +130,52 @@ fn summarize_lessons() -> CmdResult<String> {
     s(el::summarize_lessons(&c))
 }
 
+#[tauri::command]
+fn lint_draft(content: String) -> CmdResult<Vec<el::Violation>> {
+    let c = conn()?;
+    s(el::lint_draft(&c, &content))
+}
+
+#[tauri::command]
+fn list_patterns() -> CmdResult<Vec<el::Pattern>> {
+    let c = conn()?;
+    s(el::list_patterns(&c, None))
+}
+
+#[tauri::command]
+fn add_pattern(
+    rule: String, pattern: String, pattern_type: String, direction: String, category: String,
+    lesson_id: Option<i64>, before_text: Option<String>, after_text: Option<String>,
+) -> CmdResult<i64> {
+    let c = conn()?;
+    s(el::add_pattern(
+        &c, lesson_id, &rule, &pattern, &pattern_type, &direction, &category,
+        before_text.as_deref(), after_text.as_deref(),
+    ))
+}
+
+#[tauri::command]
+fn delete_pattern(pattern_id: i64) -> CmdResult<()> {
+    let c = conn()?;
+    s(el::delete_pattern(&c, pattern_id))
+}
+
+#[tauri::command]
+fn list_feedback() -> CmdResult<Vec<el::Feedback>> {
+    let c = conn()?;
+    s(el::list_feedback(&c))
+}
+
+#[tauri::command]
+fn compute_diff(old: String, new: String, mode: Option<String>) -> CmdResult<String> {
+    let rows = if mode.as_deref() == Some("sentences") {
+        el::rich_diff_sentences(&old, &new)
+    } else {
+        el::rich_diff(&old, &new)
+    };
+    s(serde_json::to_string(&rows))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -151,6 +197,12 @@ pub fn run() {
             add_lesson,
             search,
             summarize_lessons,
+            lint_draft,
+            list_patterns,
+            add_pattern,
+            delete_pattern,
+            list_feedback,
+            compute_diff,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

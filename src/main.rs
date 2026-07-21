@@ -83,6 +83,59 @@ enum Cmd {
     /// and get every CLI feature as tools: read pairs/diffs/lessons, record
     /// derived lessons, push and edit drafts, search.
     Mcp,
+
+    // --- lint ---
+    /// Scan a draft (or raw text) against stored voice patterns.
+    /// Prints violations as JSON. Key write-loop entry point.
+    Lint {
+        /// Draft id to lint (uses latest revision content). Mutually exclusive with --text.
+        draft_id: Option<i64>,
+        #[arg(long)]
+        text: Option<String>,
+    },
+    /// Add a matchable voice pattern for the lint engine.
+    AddPattern {
+        #[arg(long)]
+        rule: String,
+        #[arg(long)]
+        pattern: String,
+        #[arg(long, default_value = "literal")]
+        pattern_type: String,
+        #[arg(long, default_value = "avoid")]
+        direction: String,
+        #[arg(long, default_value = "style")]
+        category: String,
+        #[arg(long)]
+        lesson_id: Option<i64>,
+        #[arg(long)]
+        before: Option<String>,
+        #[arg(long)]
+        after: Option<String>,
+    },
+    /// List stored voice patterns (optionally filtered by lesson).
+    ListPatterns {
+        #[arg(long)]
+        lesson_id: Option<i64>,
+    },
+    /// Delete a pattern by id.
+    DeletePattern { pattern_id: i64 },
+    /// Analyze a finalized pair's diff: surface deletions, additions, word
+    /// swaps, and existing-pattern hits. Data for deriving new patterns.
+    Analyze { pair_id: i64 },
+
+    // --- feedback ---
+    /// Log feedback (from an agent or human) about the tool.
+    Feedback {
+        message: String,
+        #[arg(long)]
+        tool: Option<String>,
+        #[arg(long, default_value = "info")]
+        severity: String,
+        #[arg(long)]
+        rating: Option<i64>,
+    },
+    /// List all feedback entries.
+    FeedbackList,
 }
 
 fn read_text(path: &PathBuf) -> anyhow::Result<String> {
@@ -189,6 +242,51 @@ fn run() -> anyhow::Result<()> {
         Cmd::DeleteLesson { lesson_id } => {
             el::delete_lesson(&conn, lesson_id)?;
             println!("deleted lesson {lesson_id}");
+        }
+
+        Cmd::Lint { draft_id, text } => {
+            let content = if let Some(t) = text {
+                t
+            } else if let Some(id) = draft_id {
+                match el::get_draft(&conn, id)? {
+                    Some(d) => d.revisions.last().map(|r| r.content.clone())
+                        .unwrap_or_default(),
+                    None => anyhow::bail!("no draft with id {id}"),
+                }
+            } else {
+                anyhow::bail!("provide a draft id or --text");
+            };
+            let violations = el::lint_draft(&conn, &content)?;
+            println!("{}", serde_json::to_string_pretty(&violations)?);
+        }
+        Cmd::AddPattern { rule, pattern, pattern_type, direction, category, lesson_id, before, after } => {
+            let id = el::add_pattern(
+                &conn, lesson_id, &rule, &pattern, &pattern_type, &direction, &category,
+                before.as_deref(), after.as_deref(),
+            )?;
+            println!("{id}");
+        }
+        Cmd::ListPatterns { lesson_id } => {
+            let out = el::list_patterns(&conn, lesson_id)?;
+            println!("{}", serde_json::to_string_pretty(&out)?);
+        }
+        Cmd::DeletePattern { pattern_id } => {
+            el::delete_pattern(&conn, pattern_id)?;
+            println!("deleted pattern {pattern_id}");
+        }
+        Cmd::Analyze { pair_id } => {
+            match el::analyze_diff(&conn, pair_id)? {
+                Some(a) => println!("{}", serde_json::to_string_pretty(&a)?),
+                None => eprintln!("no pair with id {pair_id}"),
+            }
+        }
+        Cmd::Feedback { message, tool, severity, rating } => {
+            let id = el::add_feedback(&conn, tool.as_deref(), &message, &severity, rating, None)?;
+            println!("{id}");
+        }
+        Cmd::FeedbackList => {
+            let out = el::list_feedback(&conn)?;
+            println!("{}", serde_json::to_string_pretty(&out)?);
         }
         Cmd::Mcp => {
             // The MCP server speaks JSON-RPC over stdio and needs the tokio

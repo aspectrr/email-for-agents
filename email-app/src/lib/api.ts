@@ -71,6 +71,41 @@ export interface SearchResult {
   lessons: Lesson[];
 }
 
+export interface Pattern {
+  id: number;
+  lesson_id: number | null;
+  rule: string;
+  pattern: string;
+  pattern_type: string;
+  direction: string;
+  category: string;
+  before_text: string | null;
+  after_text: string | null;
+  confidence: string;
+  created_at: string;
+}
+
+export interface Violation {
+  pattern_id: number;
+  lesson_id: number | null;
+  rule: string;
+  category: string;
+  direction: string;
+  matched_text: string;
+  context: string;
+  line: number;
+}
+
+export interface Feedback {
+  id: number;
+  tool_name: string | null;
+  message: string;
+  severity: string;
+  rating: number | null;
+  agent_id: string | null;
+  created_at: string;
+}
+
 export const api = {
   listDrafts: (includeFinalized = false) =>
     invoke<Draft[]>("list_drafts", { includeFinalized }),
@@ -93,4 +128,16 @@ export const api = {
   addLesson: (pairId: number, lesson: string, tags: string[]) =>
     invoke<number>("add_lesson", { pairId, lesson, tags }),
   search: (needle: string) => invoke<SearchResult>("search", { needle }),
+  lintDraft: (content: string) => invoke<Violation[]>("lint_draft", { content }),
+  listPatterns: () => invoke<Pattern[]>("list_patterns"),
+  addPattern: (
+    rule: string, pattern: string, patternType: string, direction: string, category: string,
+    lessonId: number | null, beforeText: string | null, afterText: string | null,
+  ) => invoke<number>("add_pattern", {
+    rule, pattern, patternType, direction, category, lessonId, beforeText, afterText,
+  }),
+  deletePattern: (patternId: number) => invoke<void>("delete_pattern", { patternId }),
+  listFeedback: () => invoke<Feedback[]>("list_feedback"),
+  computeDiff: (old: string, newText: string, mode?: string) =>
+    invoke<string>("compute_diff", { old, new: newText, mode }),
 };

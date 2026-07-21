@@ -47,6 +47,29 @@ CREATE TABLE IF NOT EXISTS draft_revisions (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pairs_tags ON pairs(tags);
+CREATE TABLE IF NOT EXISTS patterns (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    lesson_id    INTEGER REFERENCES lessons(id) ON DELETE SET NULL,
+    rule         TEXT NOT NULL,
+    pattern      TEXT NOT NULL,
+    pattern_type TEXT NOT NULL DEFAULT 'literal',
+    direction    TEXT NOT NULL DEFAULT 'avoid',
+    category     TEXT NOT NULL DEFAULT 'style',
+    before_text  TEXT,
+    after_text   TEXT,
+    confidence   TEXT NOT NULL DEFAULT 'unconfirmed',
+    created_at   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS feedback (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    tool_name    TEXT,
+    message      TEXT NOT NULL,
+    severity     TEXT NOT NULL DEFAULT 'info',
+    rating       INTEGER,
+    agent_id     TEXT,
+    created_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_patterns_lesson ON patterns(lesson_id);
 CREATE INDEX IF NOT EXISTS idx_lessons_tags ON lessons(tags);
 CREATE INDEX IF NOT EXISTS idx_drafts_status ON drafts(status);
 CREATE INDEX IF NOT EXISTS idx_draft_revisions_draft ON draft_revisions(draft_id);
@@ -213,6 +236,41 @@ pub fn unified_diff(old: &str, new: &str) -> String {
     render_diff_plain(&rich_diff(old, new))
 }
 
+// ---------- sentence-level diff ----------
+//
+// Emails aren't code. Line-level diffs split mid-sentence and make paragraph
+// rewrites look like 20 separate changes. Sentence-level diff groups by
+// sentence so "this sentence was rewritten" is one insight, not noise.
+
+/// Split text into sentences, keeping the trailing punctuation/whitespace.
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        current.push(c);
+        if matches!(c, '.' | '!' | '?') {
+            if let Some(&next) = chars.peek() {
+                if next.is_whitespace() {
+                    result.push(std::mem::take(&mut current));
+                }
+            }
+        }
+    }
+    if !current.is_empty() {
+        result.push(current);
+    }
+    result
+}
+
+/// Sentence-level diff: same algorithm as rich_diff but splits on sentence
+/// boundaries instead of newlines. Each row is a sentence, not a line.
+pub fn rich_diff_sentences(old: &str, new: &str) -> Vec<DiffRow> {
+    let old_s = split_sentences(old).join("\n");
+    let new_s = split_sentences(new).join("\n");
+    rich_diff(&old_s, &new_s)
+}
+
 /// Stored diff is JSON once written by the current code; rows from before the
 /// rich-diff change hold plain text and are recomputed from draft/final.
 fn pair_diff(stored: &str, draft: &str, final_: &str) -> String {
@@ -273,6 +331,52 @@ pub struct DraftWithRevisions {
     pub draft: Draft,
     pub revisions: Vec<DraftRevision>,
     pub working_diff: String,
+}
+
+// ---------- lint patterns ----------
+
+/// A matchable voice rule. The `pattern` field is what the lint engine tests
+/// against draft content; `before_text`/`after_text` are human-readable
+/// examples that help the agent understand the rule's intent.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Pattern {
+    pub id: i64,
+    pub lesson_id: Option<i64>,
+    pub rule: String,
+    pub pattern: String,
+    pub pattern_type: String,  // "literal" | "regex"
+    pub direction: String,     // "avoid" | "prefer"
+    pub category: String,      // "punctuation" | "style" | "structure" | "factual" | "deletion"
+    pub before_text: Option<String>,
+    pub after_text: Option<String>,
+    pub confidence: String,    // "unconfirmed" | "confirmed"
+    pub created_at: String,
+}
+
+/// One rule violation found in draft content.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Violation {
+    pub pattern_id: i64,
+    pub lesson_id: Option<i64>,
+    pub rule: String,
+    pub category: String,
+    pub direction: String,
+    pub matched_text: String,
+    pub context: String,
+    pub line: usize,
+}
+
+// ---------- feedback ----------
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Feedback {
+    pub id: i64,
+    pub tool_name: Option<String>,
+    pub message: String,
+    pub severity: String,
+    pub rating: Option<i64>,
+    pub agent_id: Option<String>,
+    pub created_at: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -612,6 +716,273 @@ pub fn delete_lesson(conn: &Connection, lesson_id: i64) -> anyhow::Result<()> {
     conn.execute("DELETE FROM lessons WHERE id = ?1", params![lesson_id])?;
     Ok(())
 }
+
+// ---------- lint patterns ----------
+
+pub fn add_pattern(
+    conn: &Connection,
+    lesson_id: Option<i64>,
+    rule: &str,
+    pattern: &str,
+    pattern_type: &str,
+    direction: &str,
+    category: &str,
+    before_text: Option<&str>,
+    after_text: Option<&str>,
+) -> anyhow::Result<i64> {
+    let now = now_iso();
+    conn.execute(
+        "INSERT INTO patterns (lesson_id, rule, pattern, pattern_type, direction, category, before_text, after_text, confidence, created_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'unconfirmed',?9)",
+        params![lesson_id, rule, pattern, pattern_type, direction, category, before_text, after_text, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn list_patterns(conn: &Connection, lesson_id: Option<i64>) -> anyhow::Result<Vec<Pattern>> {
+    let mut stmt = if lesson_id.is_some() {
+        conn.prepare(
+            "SELECT id, lesson_id, rule, pattern, pattern_type, direction, category, before_text, after_text, confidence, created_at
+             FROM patterns WHERE lesson_id = ?1 ORDER BY id DESC",
+        )?
+    } else {
+        conn.prepare(
+            "SELECT id, lesson_id, rule, pattern, pattern_type, direction, category, before_text, after_text, confidence, created_at
+             FROM patterns ORDER BY id DESC",
+        )?
+    };
+    let rows = if lesson_id.is_some() {
+        stmt.query_map(params![lesson_id], row_to_pattern)?
+    } else {
+        stmt.query_map([], row_to_pattern)?
+    };
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
+pub fn delete_pattern(conn: &Connection, pattern_id: i64) -> anyhow::Result<()> {
+    conn.execute("DELETE FROM patterns WHERE id = ?1", params![pattern_id])?;
+    Ok(())
+}
+
+/// Scan draft content against all stored patterns. Returns violations for
+/// "avoid" patterns that matched and suggestions for "prefer" patterns that
+/// were absent.
+pub fn lint_draft(conn: &Connection, content: &str) -> anyhow::Result<Vec<Violation>> {
+    let patterns = list_patterns(conn, None)?;
+    let mut violations = Vec::new();
+
+    for pat in &patterns {
+        let matches = match pat.pattern_type.as_str() {
+            "regex" => {
+                match regex::Regex::new(&pat.pattern) {
+                    Ok(re) => {
+                        re.find_iter(content)
+                            .map(|m| (m.as_str().to_string(), content[..m.start()].matches('\n').count() + 1))
+                            .collect::<Vec<_>>()
+                    }
+                    Err(_) => continue, // skip invalid regex
+                }
+            }
+            _ => {
+                // literal, case-insensitive
+                let lower = content.to_lowercase();
+                let needle = pat.pattern.to_lowercase();
+                lower.match_indices(&needle)
+                    .map(|(idx, _)| {
+                        let line = content[..idx].matches('\n').count() + 1;
+                        // recover original-case matched text
+                        let matched = &content[idx..idx + pat.pattern.len()];
+                        (matched.to_string(), line)
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        match pat.direction.as_str() {
+            "prefer" => {
+                if matches.is_empty() {
+                    // pattern absent — suggest it
+                    violations.push(Violation {
+                        pattern_id: pat.id,
+                        lesson_id: pat.lesson_id,
+                        rule: pat.rule.clone(),
+                        category: pat.category.clone(),
+                        direction: "prefer".into(),
+                        matched_text: String::new(),
+                        context: format!("consider using: {}", pat.pattern),
+                        line: 0,
+                    });
+                }
+            }
+            _ => { // "avoid"
+                for (matched, line) in &matches {
+                    // ponytail: simple context window — 40 chars each side of the match
+                    let match_pos = content.find(matched.as_str()).unwrap_or(0);
+                    let ctx_start = match_pos.saturating_sub(40);
+                    let ctx_end = (match_pos + matched.len() + 40).min(content.len());
+                    let context = &content[ctx_start..ctx_end];
+                    violations.push(Violation {
+                        pattern_id: pat.id,
+                        lesson_id: pat.lesson_id,
+                        rule: pat.rule.clone(),
+                        category: pat.category.clone(),
+                        direction: "avoid".into(),
+                        matched_text: matched.clone(),
+                        context: context.replace('\n', " "),
+                        line: *line,
+                    });
+                }
+            }
+        }
+    }
+    Ok(violations)
+}
+
+// ---------- diff analysis (surface patterns for lesson derivation) ----------
+
+/// Extracted signal from a pair's diff, structured so an agent can derive
+/// candidate voice patterns without manual archaeology.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct DiffAnalysis {
+    pub pair_id: i64,
+    /// All deleted segments — the strongest voice signal (what got cut).
+    pub deletions: Vec<String>,
+    /// All added segments.
+    pub additions: Vec<String>,
+    /// Word-level swaps: (old_word, new_word) for inline replacements.
+    pub word_swaps: Vec<(String, String)>,
+    /// Existing lint patterns that fire on this pair's draft (what was avoided
+    /// before and got through — or was deliberately kept).
+    pub draft_pattern_hits: Vec<PatternHit>,
+    pub final_pattern_hits: Vec<PatternHit>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PatternHit {
+    pub pattern_id: i64,
+    pub rule: String,
+}
+
+/// Analyze a finalized pair's diff. Surfaces deletions, additions, word swaps,
+/// and existing-pattern hits so the agent can derive new patterns or confirm
+/// existing ones in one call.
+pub fn analyze_diff(conn: &Connection, pair_id: i64) -> anyhow::Result<Option<DiffAnalysis>> {
+    let pair = match show_pair(conn, pair_id)? {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+
+    let rows: Vec<DiffRow> = serde_json::from_str(&pair.diff).unwrap_or_default();
+    let mut deletions = Vec::new();
+    let mut additions = Vec::new();
+    let mut word_swaps = Vec::new();
+
+    let mut i = 0;
+    while i < rows.len() {
+        if rows[i].kind == "removed" {
+            let del_text: String = rows[i].segments.iter()
+                .filter(|s| s.tag == "del" || s.tag == "ctx")
+                .map(|s| s.text.as_str())
+                .collect();
+            let del_words: Vec<&str> = rows[i].segments.iter()
+                .filter(|s| s.tag == "del")
+                .map(|s| s.text.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            // pair with next added row for word-level swaps
+            if i + 1 < rows.len() && rows[i + 1].kind == "added" {
+                let add_words: Vec<&str> = rows[i + 1].segments.iter()
+                    .filter(|s| s.tag == "add")
+                    .map(|s| s.text.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                for (d, a) in del_words.iter().zip(add_words.iter()) {
+                    word_swaps.push((d.to_string(), a.to_string()));
+                }
+                let add_text: String = rows[i + 1].segments.iter()
+                    .filter(|s| s.tag == "add" || s.tag == "ctx")
+                    .map(|s| s.text.as_str())
+                    .collect();
+                additions.push(add_text.trim().to_string());
+                i += 2;
+            } else {
+                deletions.push(del_text.trim().to_string());
+                i += 1;
+            }
+        } else if rows[i].kind == "added" {
+            let add_text: String = rows[i].segments.iter()
+                .map(|s| s.text.as_str())
+                .collect();
+            additions.push(add_text.trim().to_string());
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+
+    // Check existing patterns against draft and final
+    let patterns = list_patterns(conn, None)?;
+    let draft_hits: Vec<PatternHit> = patterns.iter()
+        .filter(|p| match p.pattern_type.as_str() {
+            "regex" => regex::Regex::new(&p.pattern).map(|r| r.is_match(&pair.draft)).unwrap_or(false),
+            _ => pair.draft.to_lowercase().contains(&p.pattern.to_lowercase()),
+        })
+        .map(|p| PatternHit { pattern_id: p.id, rule: p.rule.clone() })
+        .collect();
+    let final_hits: Vec<PatternHit> = patterns.iter()
+        .filter(|p| match p.pattern_type.as_str() {
+            "regex" => regex::Regex::new(&p.pattern).map(|r| r.is_match(&pair.final_)).unwrap_or(false),
+            _ => pair.final_.to_lowercase().contains(&p.pattern.to_lowercase()),
+        })
+        .map(|p| PatternHit { pattern_id: p.id, rule: p.rule.clone() })
+        .collect();
+
+    Ok(Some(DiffAnalysis {
+        pair_id,
+        deletions,
+        additions,
+        word_swaps,
+        draft_pattern_hits: draft_hits,
+        final_pattern_hits: final_hits,
+    }))
+}
+
+// ---------- feedback ----------
+
+pub fn add_feedback(
+    conn: &Connection,
+    tool_name: Option<&str>,
+    message: &str,
+    severity: &str,
+    rating: Option<i64>,
+    agent_id: Option<&str>,
+) -> anyhow::Result<i64> {
+    let now = now_iso();
+    conn.execute(
+        "INSERT INTO feedback (tool_name, message, severity, rating, agent_id, created_at)
+         VALUES (?1,?2,?3,?4,?5,?6)",
+        params![tool_name, message, severity, rating, agent_id, now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn list_feedback(conn: &Connection) -> anyhow::Result<Vec<Feedback>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, tool_name, message, severity, rating, agent_id, created_at
+         FROM feedback ORDER BY id DESC",
+    )?;
+    let rows = stmt.query_map([], row_to_feedback)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
 /// History is never destroyed — this is your "restore in one place".
 pub fn restore_revision(
     conn: &Connection,
@@ -751,6 +1122,34 @@ fn row_to_draft(r: &rusqlite::Row<'_>) -> rusqlite::Result<Draft> {
         finalized_pair_id: r.get(4)?,
         created_at: r.get(5)?,
         updated_at: r.get(6)?,
+    })
+}
+
+fn row_to_pattern(r: &rusqlite::Row<'_>) -> rusqlite::Result<Pattern> {
+    Ok(Pattern {
+        id: r.get(0)?,
+        lesson_id: r.get(1)?,
+        rule: r.get(2)?,
+        pattern: r.get(3)?,
+        pattern_type: r.get(4)?,
+        direction: r.get(5)?,
+        category: r.get(6)?,
+        before_text: r.get(7)?,
+        after_text: r.get(8)?,
+        confidence: r.get(9)?,
+        created_at: r.get(10)?,
+    })
+}
+
+fn row_to_feedback(r: &rusqlite::Row<'_>) -> rusqlite::Result<Feedback> {
+    Ok(Feedback {
+        id: r.get(0)?,
+        tool_name: r.get(1)?,
+        message: r.get(2)?,
+        severity: r.get(3)?,
+        rating: r.get(4)?,
+        agent_id: r.get(5)?,
+        created_at: r.get(6)?,
     })
 }
 
@@ -922,5 +1321,68 @@ mod tests {
         // and recent_pairs must agree (same normalization path)
         let list = recent_pairs(&conn, 10).unwrap();
         assert_eq!(list[0].diff, pair.diff, "show_pair and recent_pairs agree");
+    }
+
+    #[test]
+    fn lint_catches_avoid_pattern_and_suggests_prefer() {
+        let path = tmp_db();
+        let conn = connect_at(&path).unwrap();
+
+        // avoid pattern: em-dashes
+        add_pattern(&conn, None, "No em-dashes", "—", "literal", "avoid", "punctuation", None, None).unwrap();
+        // prefer pattern: use the word "quick" not "fast"
+        add_pattern(&conn, None, "Prefer quick over fast", "quick", "literal", "prefer", "style", None, None).unwrap();
+
+        // content with an em-dash and no "quick" → 2 violations
+        let v = lint_draft(&conn, "Hey — that was fast.").unwrap();
+        assert_eq!(v.len(), 2, "should have 2 violations: em-dash + missing 'quick'");
+        let has_emdash = v.iter().any(|x| x.rule == "No em-dashes");
+        assert!(has_emdash, "em-dash violation present");
+        let has_quick = v.iter().any(|x| x.direction == "prefer");
+        assert!(has_quick, "prefer suggestion for missing 'quick'");
+
+        // content that's clean → 0 violations
+        let v2 = lint_draft(&conn, "Hey. That was quick.").unwrap();
+        assert_eq!(v2.len(), 0, "clean content should have 0 violations");
+    }
+
+    #[test]
+    fn lint_regex_pattern_works() {
+        let path = tmp_db();
+        let conn = connect_at(&path).unwrap();
+        add_pattern(&conn, None, "No terse openers", r"^.{1,10}$", "regex", "avoid", "style", None, None).unwrap();
+        let v = lint_draft(&conn, "Hi.").unwrap();
+        assert!(!v.is_empty(), "regex pattern should match terse 'Hi.'");
+    }
+
+    #[test]
+    fn analyze_diff_surfaces_word_swaps_and_pattern_hits() {
+        let path = tmp_db();
+        let conn = connect_at(&path).unwrap();
+        // pattern: avoid em-dashes
+        add_pattern(&conn, None, "No em-dashes", "—", "literal", "avoid", "punctuation", None, None).unwrap();
+        // pair: draft had em-dash, final removed it
+        let pair_id = add_pair(&conn, "Hey — quick update.", "Hey. Quick update.", Some("test"), &[]).unwrap();
+        let a = analyze_diff(&conn, pair_id).unwrap().expect("analysis exists");
+        assert!(!a.word_swaps.is_empty(), "should have word swaps");
+        assert!(!a.draft_pattern_hits.is_empty(), "draft should hit em-dash pattern");
+        assert!(a.final_pattern_hits.is_empty(), "final should have no em-dash hits");
+    }
+
+    #[test]
+    fn sentence_diff_groups_by_sentence() {
+        let old = "I wanted to reach out about the project.\nThis is really important.\nLet's talk next week.";
+        let new = "Quick note on the project.\nThis matters a lot.\nLet's chat next week.";
+        let sent_rows = rich_diff_sentences(old, new);
+        // both should detect changes
+        assert!(sent_rows.iter().any(|r| r.kind != "equal"), "should have changes");
+        // each changed row should contain a full sentence, not a partial line fragment
+        let changed_texts: Vec<String> = sent_rows.iter()
+            .filter(|r| r.kind != "equal")
+            .map(|r| r.segments.iter().map(|s| s.text.as_str()).collect::<String>())
+            .collect();
+        // at least one row should contain a complete sentence with punctuation
+        assert!(changed_texts.iter().any(|t| t.contains('.') || t.contains('!') || t.contains('?')),
+            "sentence diff rows should contain sentence-level text: {changed_texts:?}");
     }
 }
