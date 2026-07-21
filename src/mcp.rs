@@ -280,8 +280,8 @@ impl EmailServer {
     /// Read a draft: metadata, every revision (append-only), and the working
     /// diff between the original and latest revision.
     #[tool(description = "Read a draft: metadata, full revision history, and the working diff (original → latest).")]
-    fn get_draft(&self, Parameters(p): Parameters<IdParams>) -> ToolResult {
-        tool_op(|conn| match el::get_draft(conn, p.id)? {
+    fn get_draft(&self, Parameters(p): Parameters<DraftIdParams>) -> ToolResult {
+        tool_op(|conn| match el::get_draft(conn, p.draft_id)? {
             Some(d) => {
                 let (first, last) = (d.revisions.first(), d.revisions.last());
                 let working_diff = match (first, last) {
@@ -298,7 +298,7 @@ impl EmailServer {
                     "revision_count": d.revisions.len(),
                 })))
             }
-            None => Ok(err_text(format!("no draft with id {}", p.id))),
+            None => Ok(err_text(format!("no draft with id {}", p.draft_id))),
         })
     }
 
