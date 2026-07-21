@@ -4,7 +4,9 @@ on:
   push:
     tags:
       - "v*"
-  workflow_dispatch: # manual trigger from Actions tab
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -42,7 +44,7 @@ jobs:
                (macOS Gatekeeper blocks unsigned apps on first run)
 
             Requires macOS 11+ (universal binary: Apple Silicon + Intel).
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           # Universal binary covers both Apple Silicon and Intel
           args: --target universal-apple-darwin
