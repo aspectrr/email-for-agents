@@ -72,6 +72,14 @@ export default function App() {
   }, [refreshDrafts]);
   useEffect(() => { if (view === "drafts") refreshDrafts(); }, [view, refreshDrafts]);
 
+  // ponytail: 5s poll catches MCP/CLI draft pushes while the user sits on
+  // the Drafts tab. Upgrade path: Tauri event from the backend on DB change.
+  useEffect(() => {
+    if (view !== "drafts") return;
+    const id = setInterval(refreshDrafts, 5000);
+    return () => clearInterval(id);
+  }, [view, refreshDrafts]);
+
   // autosave flush: write pending edit synchronously, returns when done.
   const flushSave = useCallback(async () => {
     if (saveTimer.current) { window.clearTimeout(saveTimer.current); saveTimer.current = null; }
